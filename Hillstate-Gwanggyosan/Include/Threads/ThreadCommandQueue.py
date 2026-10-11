@@ -343,9 +343,10 @@ class ThreadCommandQueue(threading.Thread):
         else:
             return
         """
-        packet_command = dev.makePacketCall(target)
+        packet_candidates = dev.makePacketCallCandidates(target)
         interval, retry_cnt = self.getSendParams(parser)
         success = False
+        last_sent = None
         while cnt < retry_cnt:
             if dev.check_call_command_done(target):
                 success = True
@@ -353,12 +354,18 @@ class ThreadCommandQueue(threading.Thread):
             if parser.isRS485LineBusy():
                 time.sleep(1e-3)  # prevent cpu occupation
                 continue
-            parser.sendPacket(packet_command)
+            last_sent = packet_candidates[cnt % len(packet_candidates)]
+            parser.sendPacket(last_sent)
             cnt += 1
             time.sleep(interval)  # wait for parsing response
         if cnt > 0:
             tm_elapsed = time.perf_counter() - tm_start
-            writeLog('set_elevator_call({})::send # = {}, elapsed = {:g} msec'.format(target, cnt, tm_elapsed * 1000), self)
+            writeLog('set_elevator_call({})::send # = {}, elapsed = {:g} msec, success = {}'.format(
+                target, cnt, tm_elapsed * 1000, success), self)
+            if success and len(packet_candidates) > 1 and last_sent is not None:
+                call_type = 1 if last_sent[4] == 0x04 else 0
+                writeLog(f'set_elevator_call::auto call type - response detected after sending type {call_type} packet '
+                         f'({parser.prettifyPacket(last_sent)}), consider setting elevator_packet_call_type={call_type}', self)
             time.sleep(self._delay_response)
         if not success and change_state:
             pass

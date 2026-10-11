@@ -270,7 +270,7 @@
 {{ super() }}
 <script>
 setInterval(function() { $.ajax({
-    url: '/api/hems/update',
+    url: '{{ request.script_root }}/api/hems/update',
     type: 'POST',
     success: function(response) {
         $("#current_time").html(response["current_time"]);

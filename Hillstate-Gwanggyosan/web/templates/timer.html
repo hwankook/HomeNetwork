@@ -165,7 +165,7 @@ $(document).ready(function() {
 func_activate = function(idx, dev) {
     var checked = $('#room' + idx + '_' + dev + '_active').is(":checked");
     $.ajax({
-        url: '/api/timer/set/' + idx + '/' + dev,
+        url: '{{ request.script_root }}/api/timer/set/' + idx + '/' + dev,
         type: 'POST',
         dataType: 'json',
         data: JSON.stringify({
@@ -181,7 +181,7 @@ func_setparam = function(idx, dev) {
     var off_time = $('#room' + idx + '_' + dev + '_offtime').val();
     var repeat = $('#room' + idx + '_' + dev + '_repeat').is(":checked");
     $.ajax({
-        url: '/api/timer/set/' + idx + '/' + dev,
+        url: '{{ request.script_root }}/api/timer/set/' + idx + '/' + dev,
         type: 'POST',
         dataType: 'json',
         data: JSON.stringify({

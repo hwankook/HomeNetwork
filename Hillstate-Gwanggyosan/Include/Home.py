@@ -181,9 +181,58 @@ class Home:
             self.startFFMpeg()
             if self.isHEMSActivated():
                 self.startThreadEnergyMonitor()
+        self.assignExpectedHeadersToParsers()
         if connect_rs485:
             self.initRS485Connection()
         writeLog(f'Initialized <{self.name}>', self)
+
+    DEVICE_TYPE_HEADERS = {
+        DeviceType.EMOTIONLIGHT: 0x15,
+        DeviceType.THERMOSTAT: 0x18,
+        DeviceType.LIGHT: 0x19,
+        DeviceType.DIMMINGLIGHT: 0x1A,
+        DeviceType.GASVALVE: 0x1B,
+        DeviceType.AIRCONDITIONER: 0x1C,
+        DeviceType.OUTLET: 0x1F,
+        DeviceType.BATCHOFFSWITCH: 0x2A,
+        DeviceType.VENTILATOR: 0x2B,
+        DeviceType.ELEVATOR: 0x34,
+    }
+
+    def getParserIndex(self, dev_type: DeviceType, rs485_port_index: int = -1) -> int:
+        index = self.parser_mapping.get(dev_type, 0)
+        if 0 <= rs485_port_index < len(self.rs485_info_list):
+            index = rs485_port_index
+        return index
+
+    def getParser(self, dev_type: DeviceType, rs485_port_index: int = -1) -> Union[PacketParser, None]:
+        index = self.getParserIndex(dev_type, rs485_port_index)
+        if 0 <= index < len(self.rs485_info_list):
+            return self.rs485_info_list[index].parser
+        return None
+
+    def assignExpectedHeadersToParsers(self):
+        # RS-485 라인 연결 진단용: 각 포트에서 수신되어야 할 패킷 헤더 목록을 파서에 알려준다
+        try:
+            expected = dict()
+            for dev in self.device_list:
+                header = self.DEVICE_TYPE_HEADERS.get(dev.getType())
+                if header is None:
+                    continue
+                parser = self.getParser(dev.getType(), dev.rs485_port_index)
+                if parser is not None:
+                    expected.setdefault(id(parser), (parser, set()))[1].add(header)
+            # 난방은 등록 여부와 무관하게 매핑된 포트에서 주기적으로 보여야 한다 (탐색 실패 진단)
+            parser = self.getParser(DeviceType.THERMOSTAT)
+            if parser is not None:
+                expected.setdefault(id(parser), (parser, set()))[1].add(0x18)
+            for parser, headers in expected.values():
+                if parser.type_interpret is ParserType.REGULAR:
+                    parser.setExpectedHeaders(headers)
+                    writeLog(f"<{parser.name}> expected packet headers: " +
+                             ', '.join(f'0x{h:02X}' for h in sorted(headers)), self)
+        except Exception as e:
+            writeLog(f'assignExpectedHeadersToParsers::Exception::{e}', self)
 
     def initMQTT(self):
         self.mqtt_client = mqtt.Client(

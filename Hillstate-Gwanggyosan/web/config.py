@@ -520,6 +520,16 @@ class Config:
                 node.append(entry_node)
             
             elev_nodes = list(filter(lambda x: x.tag == 'elevator', list(entry_node)))
+            if len(elev_nodes) == 0 and cfg.get('elevator_force_register', False):
+                # 복도 미니패드가 없는 세대는 평상시 엘리베이터(0x34) 패킷이 없어 자동 탐색으로 등록되지 않으므로 강제 등록
+                elev_node = ET.Element('elevator')
+                for tag, text in [('name', 'ELEVATOR'), ('index', '0'), ('room', '0'), ('enable', '1')]:
+                    child = ET.Element(tag)
+                    child.text = text
+                    elev_node.append(child)
+                entry_node.append(elev_node)
+                elev_nodes = [elev_node]
+                print('Config::set_config_etc::elevator entry is force-registered')
             for pnode in list(elev_nodes):
                 elem = pnode.find('packet_call_type')
                 if elem is None:

@@ -9,7 +9,7 @@
     <input type="button" id="btn_start" onclick="onBtnStartClicked();" value="START">
     <input type="button" id="btn_stop"  onclick="onBtnStopClicked();"  value="STOP">
     <h2>조명, 아울렛</h2>
-    <form action="/api/packet_logger/clear/light" method="POST">
+    <form action="{{ request.script_root }}/api/packet_logger/clear/light" method="POST">
         <input type="submit" value="CLEAR">
     </form>
     <label>Header </label>
@@ -20,7 +20,7 @@
     <div id="textbox_light" style="height:300px; width: 100%; border: 1px solid #ccc; overflow-x: scroll; overflow-y: scroll; overflow-wrap: break-word;"></div>
 
     <h2>기타</h2>
-    <form action="/api/packet_logger/clear/various" method="POST">
+    <form action="{{ request.script_root }}/api/packet_logger/clear/various" method="POST">
         <input type="submit" value="CLEAR">
     </form>
     <label>Header </label>
@@ -37,7 +37,7 @@
     <div id="textbox_various" style="height:300px; width: 100%; border: 1px solid #ccc; overflow-x: scroll; overflow-y: scroll; overflow-wrap: break-word;"></div>
 
     <h2>주방 비디오폰</h2>
-    <form action="/api/packet_logger/clear/subphone" method="POST">
+    <form action="{{ request.script_root }}/api/packet_logger/clear/subphone" method="POST">
         <input type="submit" value="CLEAR">
     </form>
     <label><input type="checkbox" id="check_subphone_enable" onclick="onCheckHeaderSubphone()" {% if enable_subphone==1 %} checked {% endif %}>Enable</label>
@@ -53,7 +53,7 @@
     var interval;
     function onBtnStartClicked() {
         interval = setInterval(function(){$.ajax({
-            url: '/api/packet_logger/update',
+            url: '{{ request.script_root }}/api/packet_logger/update',
             type: 'POST',
             success: function(response) {
                 $("#textbox_light").html(response["light"]);
@@ -79,15 +79,15 @@
 
         if (value == 0x19) {
             var checked = document.getElementById("check_light_header_19").checked;
-            newForm.attr("action", "/api/packet_logger/enable/light/19");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/light/19");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x1E) {
             var checked = document.getElementById("check_light_header_1E").checked;
-            newForm.attr("action", "/api/packet_logger/enable/light/1E");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/light/1E");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x1F) {
             var checked = document.getElementById("check_light_header_1F").checked;
-            newForm.attr("action", "/api/packet_logger/enable/light/1F");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/light/1F");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         }
 
@@ -103,39 +103,39 @@
 
         if (value == 0x18) {
             var checked = document.getElementById("check_various_header_18").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/18");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/18");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x1B) {
             var checked = document.getElementById("check_various_header_1B").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/1B");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/1B");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x1C) {
             var checked = document.getElementById("check_various_header_1C").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/1C");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/1C");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x2A) {
             var checked = document.getElementById("check_various_header_2A").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/2A");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/2A");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x2B) {
             var checked = document.getElementById("check_various_header_2B").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/2B");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/2B");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x34) {
             var checked = document.getElementById("check_various_header_34").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/34");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/34");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x43) {
             var checked = document.getElementById("check_various_header_43").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/43");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/43");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x44) {
             var checked = document.getElementById("check_various_header_44").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/44");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/44");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         } else if (value == 0x48) {
             var checked = document.getElementById("check_various_header_48").checked;
-            newForm.attr("action", "/api/packet_logger/enable/various/48");
+            newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/various/48");
             newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         }
 
@@ -150,7 +150,7 @@
         newForm.attr("method", "POST");
 
         var checked = document.getElementById("check_subphone_enable").checked;
-        newForm.attr("action", "/api/packet_logger/enable/subphone/00");
+        newForm.attr("action", "{{ request.script_root }}/api/packet_logger/enable/subphone/00");
         newForm.append($('<input/>', {type: 'hidden', name: 'value', value: Number(checked)}));
         
         newForm.appendTo('body');

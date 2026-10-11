@@ -5,6 +5,7 @@ from enum import IntEnum
 
 class CommandState(IntEnum):
     IDLE = 0
+    ACCEPTED = 1  # 일부 단지: 이동 중 상태(A*/B*)의 하위 4비트가 1로 들어오는 경우
     UPSIDE = 5
     DOWNSIDE = 6
     DOWNSIDE2 = 7  # Imazu (HNT-4105)?
@@ -20,6 +21,12 @@ class MovingState(IntEnum):
 class CheckCommandMethod(IntEnum):
     CALL_STATE = 0
     DEV_CMD_STATE = 1
+
+
+class PacketCallType(IntEnum):
+    COMMAND = 0  # F7 0B 01 34 02 41 10 XX 00 YY EE (월패드 명령 형식)
+    RESPONSE = 1  # F7 0B 01 34 04 41 10 00 XX YY EE (복도 미니패드 응답 형식)
+    AUTO = 2  # 0, 1 형식을 번갈아 전송
 
 
 class DevInfo:
@@ -66,7 +73,7 @@ class ThreadStateChangeTimer(threading.Thread):
         self._keepAlive = False
     
     def reset(self):
-        self.self._tick_start = time.perf_counter()
+        self._tick_start = time.perf_counter()
 
 
 class Elevator(Device):
@@ -309,8 +316,18 @@ class Elevator(Device):
     def updateState(self, _: int, **kwargs):
         data_type = kwargs.get('data_type')
         if data_type == 'query':
-            command_state = CommandState(kwargs.get('command_state', 0))  # possible values: 0(idle), 5(command up), 6/7(command down)
-            moving_state = MovingState(kwargs.get('moving_state', 0))  # possible values: 0(idle), 1(arrived), 5(moving upside), 6(moving downside)
+            raw_command_state = kwargs.get('command_state', 0)
+            try:
+                command_state = CommandState(raw_command_state)  # possible values: 0(idle), 1, 5(command up), 6/7(command down)
+            except ValueError:
+                writeLog(f"unknown command state value ({raw_command_state}), packet: {kwargs.get('packet')}", self)
+                command_state = CommandState.ACCEPTED
+            raw_moving_state = kwargs.get('moving_state', 0)
+            try:
+                moving_state = MovingState(raw_moving_state)  # possible values: 0(idle), 1(arrived), 5(moving upside), 6(moving downside)
+            except ValueError:
+                writeLog(f"unknown moving state value ({raw_moving_state}), packet: {kwargs.get('packet')}", self)
+                moving_state = MovingState.IDLE
             ev_dev_idx = kwargs.get('ev_dev_idx', 0)
             floor = kwargs.get('floor', '')
             if self.verbose_packet:
@@ -351,7 +368,10 @@ class Elevator(Device):
                 writeLog(f"[R] call: {self.state_call}, packet: {packet}")
             if self.state_call != self.state_call_prev:
                 if self.state_call:
-                    self.state = self.state_call
+                    if self.state_call == self.packet_command_call_down_value:
+                        self.state = int(CommandState.DOWNSIDE)  # HA 스위치(payload_on: 6)와 맞추기 위해 정규화
+                    else:
+                        self.state = self.state_call
                     writeLog(f"Started calling ({self.state_call})", self)
                     self.time_call_started = time.perf_counter()
                 else:
@@ -409,20 +429,35 @@ class Elevator(Device):
             self.publishMQTT()
             self.init = True
     
-    def makePacketCall(self, target: int) -> bytearray:
+    def getCallPacketValue(self, target: int) -> int:
+        # HA 스위치는 하행 호출을 항상 6으로 보낸다 -> 옵션(elevator_packet_command_call_down_value)값으로 치환
+        if target == CommandState.DOWNSIDE:
+            return self.packet_command_call_down_value
+        return target
+
+    def makePacketCall(self, target: int, call_type: Union[int, None] = None) -> bytearray:
         # 상/하행 호출
         # F7 0B 01 34 02 41 10 XX 00 YY EE
         # XX: 05 = 상행, 06 = 하행 (07 = 하행 for imazu?)
+        if call_type is None:
+            call_type = self.packet_call_type
         packet = bytearray([0xF7, 0x0B, 0x01, 0x34])
         target_value = max(0, min(0xFF, target))
-        if self.packet_call_type == 1:
+        if call_type == PacketCallType.RESPONSE:
             # 일부 환경에서는 F7 0B 01 34 04 41 10 00 XX YY EE로 호출해야 된다? (차이 파악 필요)
+            # -> 복도 미니패드가 없는 세대: 월패드는 미니패드의 '호출 버튼' 응답(04)을 받아 호출하는 것으로 추정
             packet.extend([0x04, 0x41, 0x10, 0x00, target_value])
         else:
             packet.extend([0x02, 0x41, 0x10, target_value, 0x00])
         packet.append(self.calcXORChecksum(packet))
         packet.append(0xEE)
         return packet
+
+    def makePacketCallCandidates(self, target: int) -> List[bytearray]:
+        value = self.getCallPacketValue(target)
+        if self.packet_call_type == PacketCallType.AUTO:
+            return [self.makePacketCall(value, PacketCallType.COMMAND), self.makePacketCall(value, PacketCallType.RESPONSE)]
+        return [self.makePacketCall(value)]
 
     """
     def makePacketCallDownside(self) -> bytearray:
@@ -463,13 +498,16 @@ class Elevator(Device):
     """
 
     def check_call_command_done(self, target: int) -> bool:
+        targets = {target, self.getCallPacketValue(target)}
         if self.check_command_method is CheckCommandMethod.CALL_STATE:
-            if self.state_call == target:
-                writeLog(f"check command done: call state is now <{target}>", self)
+            if self.state_call in targets:
+                writeLog(f"check command done: call state is now <{self.state_call}>", self)
                 return True
         elif self.check_command_method is CheckCommandMethod.DEV_CMD_STATE:
+            if target == CommandState.IDLE:
+                return all(info.command_state == CommandState.IDLE for info in self.dev_info_list)
             for info in self.dev_info_list:
-                if info.command_state in [target, 1]:
+                if info.command_state in targets or info.command_state == CommandState.ACCEPTED:
                     writeLog(f"check command done: dev<{info.index}> command state is now <{info.command_state}>", self)
                     return True
         return False
@@ -479,7 +517,7 @@ class Elevator(Device):
             self._thread_state_change_timer = ThreadStateChangeTimer(self, self.time_threshold_arrived_change)
             self._thread_state_change_timer.sig_action.connect(self.onThreadStateChangeTimerAction)
             self._thread_state_change_timer.sig_terminated.connect(self.onThreadStateChangeTimerTerminated)
-            self._thread_state_change_timer.setDaemon(True)
+            self._thread_state_change_timer.daemon = True
             self._thread_state_change_timer.start()
         else:
             self._thread_state_change_timer.reset()

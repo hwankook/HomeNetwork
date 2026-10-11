@@ -6,7 +6,7 @@
     <h1>엘리베이터</h1>
 </div>
 <div>
-    <form method="post" action="/api/elevator_ctrl" enctype="text/plain">
+    <form method="post" action="{{ request.script_root }}/api/elevator_ctrl" enctype="text/plain">
         <input type="submit" value="CALL(DOWN)" name="command_call_down" style="font-size: 4em;">
         <input type="submit" value="CALL(UP)" name="command_call_up" style="font-size: 4em;">
     </form>
@@ -33,7 +33,7 @@
 {{ super() }}
 <script>
 setInterval(function() { $.ajax({
-    url: '/api/elevator_ctrl/update',
+    url: '{{ request.script_root }}/api/elevator_ctrl/update',
     type: 'POST',
     success: function(response) {
         $("#time").html(response["current_time"]);

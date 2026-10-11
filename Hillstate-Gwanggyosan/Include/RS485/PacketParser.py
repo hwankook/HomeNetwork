@@ -39,6 +39,19 @@ class PacketParser:
     log_send_result: bool = True
 
     thermo_len_per_dev: int = 3  # 난방 노멀 쿼리 > 각 기기당 바이트 수는 3 혹은 8?
+    thermo_len_candidates: tuple = (3, 8)  # 설정값이 맞지 않을 때 자동으로 시도해볼 기기당 바이트 수
+    thermo_len_detected: int = 0  # 자동 판별된 기기당 바이트 수 (0 = 아직 없음)
+
+    # 헤더별 수신 통계 (RS-485 라인 연결 진단용)
+    header_names: dict = {
+        0x15: 'emotionlight', 0x18: 'thermostat', 0x19: 'light', 0x1A: 'dimminglight',
+        0x1B: 'gasvalve', 0x1C: 'airconditioner', 0x1E: 'doorlock', 0x1F: 'outlet',
+        0x2A: 'batchoffsw', 0x2B: 'ventilator', 0x34: 'elevator', 0x43: 'hems',
+        0x44: 'timestamp', 0x48: 'unknown48', 0x4B: 'unknown4B',
+    }
+    expected_headers: set  # 이 포트에 매핑된 기기들의 헤더 (Home에서 설정)
+    header_stat_first_report_sec: float = 60.
+    header_stat_report_interval_sec: float = 1800.
 
     # for debugging (todo: remove or refactoring)
     enable_store_packet_header_15: bool = False
@@ -81,6 +94,12 @@ class PacketParser:
         self.packet_storage = list()
         self.sig_parse_result = Callback(dict)
         self.debug_verbose_packet = dict()
+        self.expected_headers = set()
+        self.header_counter = dict()
+        self._header_stat_t0 = 0.
+        self._header_stat_last = 0.
+        self._header_stat_first_done = False
+        self._unknown_shape_logged = set()
         writeLog(f"<{self.name}> initialized (index: {self.index}, " \
                  f"type: {self.type_interpret.name}, " \
                  f"command interval: {self.send_command_interval_ms}ms, " \
@@ -200,6 +219,7 @@ class PacketParser:
         # self.log(f'packet: {self.prettifyPacket(packet)}')
         try:
             if self.type_interpret == ParserType.REGULAR:
+                self.countHeader(packet[3])
                 if packet[3] == 0x15:  # 감성조명
                     self.handleEmotionLight(packet)
                     packet_info['device'] = 'emotion light'
@@ -349,6 +369,82 @@ class PacketParser:
     def updateDeviceState(self, data: dict):
         data['parser_index'] = self.index
         self.sig_parse_result.emit(data)
+
+    def setExpectedHeaders(self, headers):
+        self.expected_headers = set(headers)
+
+    def countHeader(self, header: int):
+        now = time.perf_counter()
+        if self._header_stat_t0 == 0.:
+            self._header_stat_t0 = now
+            self._header_stat_last = now
+        self.header_counter[header] = self.header_counter.get(header, 0) + 1
+        elapsed_total = now - self._header_stat_t0
+        if not self._header_stat_first_done:
+            if elapsed_total >= self.header_stat_first_report_sec:
+                self._header_stat_first_done = True
+                self._header_stat_last = now
+                self.reportHeaderStatistics(elapsed_total, check_missing=True)
+        elif now - self._header_stat_last >= self.header_stat_report_interval_sec:
+            self._header_stat_last = now
+            self.reportHeaderStatistics(elapsed_total, check_missing=False)
+
+    def getHeaderName(self, header: int) -> str:
+        return self.header_names.get(header, 'unknown')
+
+    def reportHeaderStatistics(self, elapsed: float, check_missing: bool):
+        summary = ', '.join(
+            f'0x{h:02X}({self.getHeaderName(h)})={c}' for h, c in sorted(self.header_counter.items()))
+        self.log(f'RS485 header statistics ({elapsed:.0f}s): {summary}')
+        if not check_missing:
+            return
+        missing = sorted(h for h in self.expected_headers if self.header_counter.get(h, 0) == 0)
+        for h in missing:
+            self.log(f'Warning: no 0x{h:02X}({self.getHeaderName(h)}) packet received in {elapsed:.0f}s on this port. '
+                     f'This RS-485 line may not carry {self.getHeaderName(h)} traffic '
+                     f'(Hillstate wallpads often split light/outlet and thermostat/gas/ventilator/elevator '
+                     f'into separate RS-485 lines - connect another EW11 to that line and map it in parser_mapping)')
+
+    def logUnknownShapeOnce(self, tag: str, packet: bytearray):
+        key = (tag, len(packet), bytes(packet[4:7]))
+        if key in self._unknown_shape_logged:
+            return
+        if len(self._unknown_shape_logged) > 200:
+            self._unknown_shape_logged.clear()
+        self._unknown_shape_logged.add(key)
+        self.log(f'[{tag}] unhandled packet shape: {self.prettifyPacket(packet)}')
+
+    @staticmethod
+    def isValidThermostatLayout(payload: Union[bytes, bytearray], len_per_dev: int) -> bool:
+        # 기기당 [상태, 현재온도, 설정온도, ...] 배열이 맞는지 검사
+        if len_per_dev < 3 or len(payload) == 0 or len(payload) % len_per_dev != 0:
+            return False
+        exist_count = 0
+        for i in range(0, len(payload), len_per_dev):
+            state, temp_current, temp_config = payload[i], payload[i + 1], payload[i + 2]
+            if state == 0x00:
+                continue  # 존재하지 않는 방
+            if not (0 < temp_current < 70) or not (0 < temp_config < 70):
+                return False
+            exist_count += 1
+        return exist_count > 0
+
+    def resolveThermostatLenPerDev(self, payload: Union[bytes, bytearray]) -> int:
+        candidates = [self.thermo_len_per_dev]
+        if self.thermo_len_detected and self.thermo_len_detected not in candidates:
+            candidates.insert(0, self.thermo_len_detected)
+        for value in self.thermo_len_candidates:
+            if value not in candidates:
+                candidates.append(value)
+        for value in candidates:
+            if self.isValidThermostatLayout(payload, value):
+                if value != self.thermo_len_per_dev and value != self.thermo_len_detected:
+                    self.log(f'thermostat: configured thermo_len_per_dev={self.thermo_len_per_dev} does not fit packet, '
+                             f'auto-detected {value} (set add-on option etc.thermo_len_per_dev={value})')
+                if value != self.thermo_len_per_dev:
+                    self.thermo_len_detected = value
+                return value
+        return 0
 
     def handleLight(self, packet: bytearray):
         room_idx = packet[6] >> 4
@@ -564,9 +660,14 @@ class PacketParser:
             if self.debug_verbose_packet.get(DeviceType.THERMOSTAT, False):
                 writeLog("[THERMOSTAT][R]{}".format(self.prettifyPacket(packet)))
             if room_idx == 0:  # 일반 쿼리 (존재하는 모든 디바이스)
-                thermostat_count = (len(packet) - 10) // self.thermo_len_per_dev
+                payload = packet[8:-2]
+                len_per_dev = self.resolveThermostatLenPerDev(payload)
+                if len_per_dev == 0:
+                    self.logUnknownShapeOnce('THERMOSTAT', packet)
+                    return
+                thermostat_count = len(payload) // len_per_dev
                 for idx in range(thermostat_count):
-                    dev_packet = packet[8 + idx * self.thermo_len_per_dev: 8 + (idx + 1) * self.thermo_len_per_dev]
+                    dev_packet = payload[idx * len_per_dev: (idx + 1) * len_per_dev]
                     if dev_packet[0] != 0x00:  # 0이면 존재하지 않는 디바이스
                         state = 0 if dev_packet[0] == 0x04 else 1                            
                         temp_current = dev_packet[1]  # 현재 온도
@@ -592,6 +693,8 @@ class PacketParser:
                         'temp_config': temp_config
                     }
                     self.updateDeviceState(result)
+                else:
+                    self.logUnknownShapeOnce('THERMOSTAT', packet)
         else:
             if self.debug_verbose_packet.get(DeviceType.THERMOSTAT, False):
                 writeLog("[THERMOSTAT][?]{}".format(self.prettifyPacket(packet)))
@@ -659,6 +762,9 @@ class PacketParser:
                 writeLog("[AIRCONDITIONER][?]{}".format(self.prettifyPacket(packet)))
 
     def handleElevator(self, packet: bytearray):
+        if packet[4] in [0x01, 0x04] and len(packet) < (13 if packet[4] == 0x01 else 11):
+            self.logUnknownShapeOnce('ELEVATOR', packet)
+            return
         if packet[4] == 0x01:  # 상태 쿼리 (월패드 -> 복도 미니패드)
             if self.debug_verbose_packet.get(DeviceType.ELEVATOR, False):
                 writeLog("[ELEVATOR][Q]{}".format(self.prettifyPacket(packet)))
@@ -717,6 +823,7 @@ class PacketParser:
         else:
             if self.debug_verbose_packet.get(DeviceType.ELEVATOR, False):
                 writeLog("[ELEVATOR][?]{}".format(self.prettifyPacket(packet)))
+            self.logUnknownShapeOnce('ELEVATOR', packet)
 
     def handleEnergyMonitoring(self, packet: bytearray):
         if packet[4] == 0x01:  # 상태 쿼리
