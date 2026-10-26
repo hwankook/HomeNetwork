@@ -97,6 +97,14 @@ class Elevator(Device):
 
     check_command_method: CheckCommandMethod = CheckCommandMethod.CALL_STATE
 
+    # 상태 고착 방지용 타임스탬프 (time.perf_counter 기준)
+    time_last_response: float = 0.  # 마지막 미니패드 응답(04) 패킷 수신 시각
+    time_call_state_changed: float = 0.  # state_call 값이 마지막으로 바뀐 시각
+    time_dev_cmd_changed: float = 0.  # 엘리베이터 호기별 command state가 마지막으로 바뀐 시각
+    time_state_changed: float = 0.  # state 값이 마지막으로 바뀐 시각
+    call_state_stale_sec: float = 60.  # 응답 패킷 없이 이 시간이 지나면 호출 상태(state_call)를 idle로 간주
+    state_stale_sec: float = 300.  # state(호출중/도착)가 이 시간 이상 그대로면 idle로 복귀
+
     _thread_state_change_timer: Union[ThreadStateChangeTimer, None] = None
 
     def __init__(self, name: str = 'Elevator', index: int = 0, room_index: int = 0, topic_prefix: str = 'home'):
@@ -345,6 +353,8 @@ class Elevator(Device):
                     self.dev_info_list.sort(key=lambda x: x.index)
                 else:
                     dev_info = find[0]
+                if dev_info.command_state != command_state:
+                    self.time_dev_cmd_changed = time.perf_counter()
                 dev_info.command_state = command_state
                 dev_info.moving_state = moving_state
                 dev_info.floor = floor
@@ -363,6 +373,9 @@ class Elevator(Device):
                 self.publishMQTTDevInfo()
         elif data_type == 'response':
             self.state_call = kwargs.get('call_state', 0)
+            self.time_last_response = time.perf_counter()
+            if self.state_call != self.state_call_prev:
+                self.time_call_state_changed = self.time_last_response
             if self.verbose_packet:
                 packet = kwargs.get('packet')
                 writeLog(f"[R] call: {self.state_call}, packet: {packet}")
@@ -393,6 +406,7 @@ class Elevator(Device):
 
         if self.state != self.state_prev:
             writeLog(f"State changed from {self.state_prev} to {self.state}", self)
+            self.time_state_changed = time.perf_counter()
             self.arrived_flag = False
             if self.state_prev == 0:
                 if self.state in [5, 6]:
@@ -497,20 +511,63 @@ class Elevator(Device):
         return packet
     """
 
-    def check_call_command_done(self, target: int) -> bool:
+    def check_call_command_done(self, target: int, since: float = 0.) -> bool:
+        """
+        호출 명령이 월패드에 반영되었는지 확인
+        since: 명령 전송 시작 시각 - 이 시각 이후에 바뀐 상태만 '반영됨'으로 인정한다
+               (이전 호출의 상태가 남아 있으면 새 호출을 보내지도 않고 성공 처리되던 문제 방지)
+        """
         targets = {target, self.getCallPacketValue(target)}
         if self.check_command_method is CheckCommandMethod.CALL_STATE:
-            if self.state_call in targets:
+            if target == CommandState.IDLE:
+                if self.state_call == 0:
+                    writeLog("check command done: call state is idle", self)
+                    return True
+            elif self.state_call in targets and self.time_call_state_changed >= since:
                 writeLog(f"check command done: call state is now <{self.state_call}>", self)
                 return True
         elif self.check_command_method is CheckCommandMethod.DEV_CMD_STATE:
             if target == CommandState.IDLE:
                 return all(info.command_state == CommandState.IDLE for info in self.dev_info_list)
+            if self.time_dev_cmd_changed < since:
+                return False
             for info in self.dev_info_list:
                 if info.command_state in targets or info.command_state == CommandState.ACCEPTED:
                     writeLog(f"check command done: dev<{info.index}> command state is now <{info.command_state}>", self)
                     return True
         return False
+
+    def checkStaleState(self):
+        """
+        상태 고착 해제 (주기적으로, 그리고 호출 명령 직전에 호출됨)
+        - 미니패드 응답(04)이 끊긴 채 마지막 값이 '호출중'으로 남아 있는 경우
+        - 도착/호출중 상태가 비정상적으로 오래 유지되는 경우
+        """
+        now = time.perf_counter()
+        changed = False
+        if self.state_call != 0 and now - self.time_last_response > self.call_state_stale_sec:
+            writeLog(f"call state <{self.state_call}> is stale (no response packet for "
+                     f"{now - self.time_last_response:.0f} sec), reset to idle", self)
+            self.state_call = 0
+            self.state_call_prev = 0
+            self.time_call_state_changed = now
+        if self.state != 0 and now - self.time_state_changed > self.state_stale_sec:
+            writeLog(f"state <{self.state}> is stale ({now - self.time_state_changed:.0f} sec), reset to idle", self)
+            self.state = 0
+            self.state_prev = 0
+            self.time_state_changed = now
+            self.arrived_flag = False
+            for dev in self.dev_info_list:
+                dev.command_state = CommandState.IDLE
+                dev.moving_state = MovingState.IDLE
+                dev.floor = ''
+            changed = True
+        if self.arrived_flag and now - self.time_arrived > self.time_threshold_arrived_change:
+            writeLog("Clear arrived flag (stale check)", self)
+            self.arrived_flag = False
+            changed = True
+        if changed:
+            self.publishMQTT()
 
     def startThreadStateChangeTimer(self):
         if self._thread_state_change_timer is None:
@@ -533,5 +590,7 @@ class Elevator(Device):
     def onThreadStateChangeTimerAction(self):
         writeLog("Clear arrived flag (from timer)", self)
         self.state = 0
+        self.state_prev = 0
+        self.time_state_changed = time.perf_counter()
         self.arrived_flag = False
         self.publishMQTT()

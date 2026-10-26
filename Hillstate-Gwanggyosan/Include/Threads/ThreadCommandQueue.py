@@ -32,6 +32,7 @@ class ThreadCommandQueue(threading.Thread):
         while self._keepAlive:
             if not self._queue.empty():
                 elem: dict = self._queue.get()
+                seq_started = False
                 elem_txt = '\n'
                 for k, v in elem.items():
                     elem_txt += f'  {k}: {v}\n'
@@ -50,6 +51,7 @@ class ThreadCommandQueue(threading.Thread):
                     change_state = elem.get('change_state_after_command', False)
                     
                     self.sig_start_seq.emit()
+                    seq_started = True
                     if isinstance(dev, Light):
                         if category == 'state':
                             self.set_state_common(dev, target, parser, change_state)
@@ -142,9 +144,12 @@ class ThreadCommandQueue(threading.Thread):
                             if target == 'Unsecured':
                                 self.set_doorlock_open(dev, parser)
                     """
-                    self.sig_finish_seq.emit()
                 except Exception as e:
                     writeLog(str(e), self)
+                finally:
+                    # 예외가 나도 주기 조회 스레드가 멈춘 채로 남지 않도록 항상 종료 시그널 전송
+                    if seq_started:
+                        self.sig_finish_seq.emit()
             else:
                 time.sleep(1e-3)
         writeLog('Terminated', self)
@@ -343,12 +348,14 @@ class ThreadCommandQueue(threading.Thread):
         else:
             return
         """
+        dev.checkStaleState()
         packet_candidates = dev.makePacketCallCandidates(target)
         interval, retry_cnt = self.getSendParams(parser)
         success = False
         last_sent = None
         while cnt < retry_cnt:
-            if dev.check_call_command_done(target):
+            # 최소 1회는 반드시 전송하고, 전송 시작 이후에 바뀐 상태만 성공으로 인정
+            if cnt > 0 and dev.check_call_command_done(target, tm_start):
                 success = True
                 break
             if parser.isRS485LineBusy():
@@ -362,6 +369,9 @@ class ThreadCommandQueue(threading.Thread):
             tm_elapsed = time.perf_counter() - tm_start
             writeLog('set_elevator_call({})::send # = {}, elapsed = {:g} msec, success = {}'.format(
                 target, cnt, tm_elapsed * 1000, success), self)
+            if not success:
+                writeLog(f'set_elevator_call::no state change detected from wallpad after {cnt} packet(s) '
+                         f'(call state: {dev.state_call}, state: {dev.state})', self)
             if success and len(packet_candidates) > 1 and last_sent is not None:
                 call_type = 1 if last_sent[4] == 0x04 else 0
                 writeLog(f'set_elevator_call::auto call type - response detected after sending type {call_type} packet '

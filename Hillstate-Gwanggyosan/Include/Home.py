@@ -1160,6 +1160,8 @@ class Home:
     def publish_all(self):
         for dev in self.device_list:
             try:
+                if isinstance(dev, Elevator):
+                    dev.checkStaleState()
                 dev.publishMQTT()
             except ValueError as e:
                 writeLog(f'{e}: {dev}, {dev.mqtt_state_topic}', self)
