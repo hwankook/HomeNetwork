@@ -222,10 +222,6 @@ class Home:
                 parser = self.getParser(dev.getType(), dev.rs485_port_index)
                 if parser is not None:
                     expected.setdefault(id(parser), (parser, set()))[1].add(header)
-            # 난방은 등록 여부와 무관하게 매핑된 포트에서 주기적으로 보여야 한다 (탐색 실패 진단)
-            parser = self.getParser(DeviceType.THERMOSTAT)
-            if parser is not None:
-                expected.setdefault(id(parser), (parser, set()))[1].add(0x18)
             for parser, headers in expected.values():
                 if parser.type_interpret is ParserType.REGULAR:
                     parser.setExpectedHeaders(headers)
