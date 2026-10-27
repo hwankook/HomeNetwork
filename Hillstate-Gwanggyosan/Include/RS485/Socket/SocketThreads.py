@@ -68,8 +68,9 @@ class ThreadSend(ThreadCommon):
                     data = data[sendlen:]
                     datalen = len(data)
         except OSError as e:
-            if e.args[0] == 10038:
-                self.sig_exception.emit(f'OSError 10038 ({e})', True)
+            # 리눅스에서는 EPIPE(32), ECONNRESET(104), ETIMEDOUT(110) 등이 발생 - 윈도우 코드(10038)만 처리하면
+            # 전송 실패가 조용히 무시되어 연결이 끊긴 것을 알 수 없다
+            self.sig_exception.emit(f'Send failed ({e})', True)
         except Exception as e:
             self.sig_exception.emit(f'Exception ({e})', True)
 
@@ -87,19 +88,29 @@ class ThreadRecv(ThreadCommon):
             if isinstance(self._sock, socket.socket):
                 data = self._sock.recv(self._bufsize)
                 if data is None or len(data) == 0:
-                    self.sig_exception.emit('Lost connection', True)
+                    if self._keepAlive:  # 의도적으로 종료(stop)한 경우는 알리지 않음
+                        self.sig_exception.emit('Lost connection', True)
                     self.stop()
                 else:
                     self.sig_recv.emit(data)
                     self._queue_recv.put(data)
+            else:
+                time.sleep(0.1)
+        except socket.timeout:
+            pass
         except OSError as e:
-            if e.args[0] == 10038:
+            if e.args[0] == 10022:  # (windows) 아직 연결되지 않은 소켓
                 self.sig_exception.emit(str(e), False)
-                self.stop()
-            elif e.args[0] == 10022:
-                self.sig_exception.emit(str(e), False)
+                time.sleep(0.1)
+                return
+            # 리눅스: ECONNRESET(104), ETIMEDOUT(110, keepalive 실패), EBADF(9) 등
+            # 기존에는 윈도우 에러코드만 처리해서 이 경우 예외를 삼킨 채 recv를 무한 반복했다
+            if self._keepAlive:
+                self.sig_exception.emit(f'Lost connection ({e})', True)
+            self.stop()
         except Exception as e:
-            self.sig_exception.emit(f'Exception ({e})', True)
+            if self._keepAlive:
+                self.sig_exception.emit(f'Exception ({e})', True)
             self.stop()
 
 

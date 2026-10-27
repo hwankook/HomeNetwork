@@ -86,7 +86,7 @@ class RS485Comm:
         for _ in range(count):
             if self.isConnected():
                 break
-            writeLog(f'Debug Issue >> {self._last_conn_addr}, {self._last_conn_port}', self)
+            writeLog(f'Reconnecting to {self._last_conn_addr}:{self._last_conn_port}', self)
             self.connect(self._last_conn_addr, self._last_conn_port)
             time.sleep(1)
 

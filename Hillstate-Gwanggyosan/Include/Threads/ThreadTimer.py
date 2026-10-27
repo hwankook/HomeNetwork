@@ -27,7 +27,9 @@ class ThreadTimer(threading.Thread):
         interval_ms: int = 2000,
         check_idle_sec: int = 30,
         reconnect_limit_sec: int = 60,
-        verbose_regular_publish: dict = None
+        verbose_regular_publish: dict = None,
+        idle_check_list: List[RS485Comm] = None,
+        reconnect_interval_sec: float = 10.
     ):
         threading.Thread.__init__(self, name='Timer Thread')
         self._rs485_list = rs485_list
@@ -36,6 +38,11 @@ class ThreadTimer(threading.Thread):
         self._check_idle_sec = check_idle_sec
         self._reconnect_limit_sec = reconnect_limit_sec
         self._verbose_regular_publish = verbose_regular_publish
+        # idle(수신 없음) 감시 대상 - None이면 기존 동작대로 전체
+        self._idle_check_list = list(rs485_list) if idle_check_list is None else list(idle_check_list)
+        self._reconnect_interval_sec = reconnect_interval_sec  # 재접속 시도 최소 간격
+        self._last_reconnect_try = dict()  # id(obj) -> perf_counter
+        self._last_warn = dict()  # id(obj) -> perf_counter (경고 로그 도배 방지)
         self.sig_terminated = Callback()
         self.sig_publish_regular = Callback()
 
@@ -89,24 +96,37 @@ class ThreadTimer(threading.Thread):
     def set_home_initialized(self):
         self._home_initialized = True
     
+    def _warn_throttled(self, obj, msg: str, interval: float = 10.):
+        now = time.perf_counter()
+        if now - self._last_warn.get(id(obj), 0.) >= interval:
+            self._last_warn[id(obj)] = now
+            writeLog(msg, self)
+
+    def _try_reconnect(self, obj, reason: str):
+        now = time.perf_counter()
+        if now - self._last_reconnect_try.get(id(obj), 0.) < self._reconnect_interval_sec:
+            return
+        self._last_reconnect_try[id(obj)] = now
+        writeLog('Try to reconnect RS485 <{}> ({})'.format(obj.name, reason), self)
+        obj.reconnect()
+        if obj.isConnected():
+            writeLog('RS485 <{}> reconnected'.format(obj.name), self)
+
     def check_rs485_status(self) -> bool:
         result = True
         for obj in self._rs485_list:
             if obj.isConnected():
+                if obj not in self._idle_check_list:
+                    continue
                 delta = obj.time_after_last_recv()
                 if delta > self._check_idle_sec:
-                    msg = 'Warning!! RS485 <{}> is not receiving for {:.1f} seconds'.format(obj.name, delta)
-                    writeLog(msg, self)
+                    self._warn_throttled(obj, 'Warning!! RS485 <{}> is not receiving for {:.1f} seconds'.format(obj.name, delta))
                     if delta > self._reconnect_limit_sec:
                         result = False
                         # 일정 시간 이상 패킷을 받지 못하면 재접속 시도
-                        obj.reconnect()
+                        self._try_reconnect(obj, 'no packet for {:.0f} sec'.format(delta))
             else:
                 result = False
-                writeLog('Warning!! RS485 <{}> is not connected'.format(obj.name), self)
-                delta = obj.time_after_last_recv()
-                if delta > self._reconnect_limit_sec:
-                    # 일정 시간 이상 패킷을 받지 못하면 재접속 시도
-                    writeLog('Try to reconnect RS485 <{}>'.format(obj.name), self)
-                    obj.reconnect()
+                self._warn_throttled(obj, 'Warning!! RS485 <{}> is not connected'.format(obj.name))
+                self._try_reconnect(obj, 'disconnected')
         return result

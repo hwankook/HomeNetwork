@@ -89,6 +89,7 @@ class TCPClient:
                 self._sock.settimeout(None)
             else:
                 self._sock.connect((server_addr, server_port))
+            self.setKeepAlive()
             self.startThreadRecv()
             success = True
         except OSError as e:
@@ -103,20 +104,42 @@ class TCPClient:
         except Exception as e:
             writeLog(f'Unspecified exception ({e})', self)
             self.sig_exception.emit(str(e))
-        finally:
-            if success:
-                servinfo = self.getServerInfo()
-                myinfo = self.getClientInfo()
-                writeLog(f'"{self._name}" Connected (server={servinfo[0]}::{servinfo[1]}, self={myinfo[1]})', self)
-                self._last_recv_time = datetime.datetime.now()
-            else:
-                del self._sock
-                self._sock = None
-                writeLog('Failed to connect server', self)
-            self.sig_connected.emit(success)
-            return success
+
+        if success:
+            servinfo = self.getServerInfo()
+            myinfo = self.getClientInfo()
+            writeLog(f'"{self._name}" Connected (server={servinfo[0]}::{servinfo[1]}, self={myinfo[1]})', self)
+            self._last_recv_time = datetime.datetime.now()
+        else:
+            try:
+                if isinstance(self._sock, socket.socket):
+                    self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+            writeLog('Failed to connect server', self)
+        self.sig_connected.emit(success)
+        return success
+
+    def setKeepAlive(self, idle_sec: int = 10, interval_sec: int = 5, count: int = 3, user_timeout_ms: int = 30000):
+        # EW11이 와이파이 재접속/재부팅 등으로 연결을 잃으면, 데이터를 받기만 하는 이쪽 소켓은
+        # 끊긴 줄 모른 채 recv에서 영원히 대기한다 (half-open). TCP keepalive로 수십 초 안에 감지되게 한다
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt_name, value in [
+                ('TCP_KEEPIDLE', idle_sec),
+                ('TCP_KEEPINTVL', interval_sec),
+                ('TCP_KEEPCNT', count),
+                ('TCP_USER_TIMEOUT', user_timeout_ms)  # 응답 없는 전송 데이터도 이 시간 안에 실패 처리
+            ]:
+                opt = getattr(socket, opt_name, None)
+                if opt is not None:
+                    self._sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except Exception as e:
+            writeLog(f'Failed to set TCP keepalive ({e})', self)
 
     def disconnect(self):
+        self.stopThreadRecv()  # 먼저 종료 플래그를 세워서 깨어난 recv 스레드가 '연결 끊김'을 다시 보고하지 않게 한다
         if self.isRunning():
             try:
                 self._sock.shutdown(socket.SHUT_RDWR)
@@ -135,7 +158,12 @@ class TCPClient:
                 writeLog(f'Close Exception- {e}', self)
                 self.sig_exception.emit(str(e))
             writeLog('Disconnected', self)
-        self.stopThreadRecv()
+        elif isinstance(self._sock, socket.socket):
+            # peer reset 등으로 이미 끊긴 소켓 - 파일 디스크립터만 정리
+            try:
+                self._sock.close()
+            except Exception:
+                pass
         self.sig_disconnected.emit()
 
     def isRunning(self) -> bool:
@@ -217,21 +245,35 @@ class TCPClient:
         self.sig_send_data.emit(data)
 
     def startThreadRecv(self):
-        if self._threadRecv is None:
-            self._threadRecv = ThreadRecv(self._sock, self._queue_recv, self._bufsize)
-            self._threadRecv.sig_terminated.connect(self.onThreadRecvTerminated)
-            self._threadRecv.sig_exception.connect(self.onThreadException)
-            self._threadRecv.sig_recv.connect(self.onRecvSomething)
-            self._last_recv_time = datetime.datetime.now()
-            self._threadRecv.start()
+        old = self._threadRecv
+        if old is not None:
+            if old.is_alive() and old._sock is self._sock and old._keepAlive:
+                return
+            # 재접속 직후 이전 연결의 recv 스레드가 아직 종료되지 않은 경우: 새 소켓용 스레드를 별도로 띄운다
+            # (기존에는 이전 스레드가 남아 있으면 새 스레드를 만들지 않아 재접속 후 수신이 안 될 수 있었음)
+            old.stop()
+        thread = ThreadRecv(self._sock, self._queue_recv, self._bufsize)
+        thread.sig_terminated.connect(lambda t=thread: self.onThreadRecvTerminated(t))
+        thread.sig_exception.connect(lambda msg, term, t=thread: self.onThreadRecvException(t, msg, term))
+        thread.sig_recv.connect(self.onRecvSomething)
+        self._threadRecv = thread
+        self._last_recv_time = datetime.datetime.now()
+        thread.start()
 
     def stopThreadRecv(self):
         if self._threadRecv is not None:
             self._threadRecv.stop()
 
-    def onThreadRecvTerminated(self):
-        del self._threadRecv
-        self._threadRecv = None
+    def onThreadRecvTerminated(self, thread: ThreadRecv = None):
+        if thread is None or thread is self._threadRecv:
+            self._threadRecv = None
+
+    def onThreadRecvException(self, thread: ThreadRecv, message: str, terminate: bool):
+        if thread is not self._threadRecv or thread._sock is not self._sock:
+            # 이전 연결의 스레드가 늦게 보고한 예외 - 새로 맺은 연결을 끊지 않도록 무시
+            writeLog(f'Ignore exception from previous connection ({message})', self)
+            return
+        self.onThreadException(message, terminate)
 
     def startThreadCheckRecvQueue(self):
         if self._threadCheckRecvQueue is None:

@@ -1089,15 +1089,27 @@ class Home:
     def startThreadTimer(self):
         if self.thread_timer is None:
             rs485_obj_list = []
+            idle_check_list = []
             for elem in self.rs485_info_list:
                 rs485 = elem.rs485
                 config = elem.config
-                if config.enable and config.check_connection:
+                if not config.enable:
+                    continue
+                if config.check_connection:
+                    # 연결 끊김 + 일정 시간 수신 없음(idle) 모두 감시
                     rs485_obj_list.append(rs485)
+                    idle_check_list.append(rs485)
+                elif config.comm_type == RS485HwType.Socket:
+                    # check_connection을 꺼도 EW11 연결이 끊긴 경우의 재접속은 항상 수행
+                    # (기존에는 한 번 끊기면 애드온 재시작 전까지 영구히 복구되지 않았음)
+                    rs485_obj_list.append(rs485)
+                writeLog(f"<{elem.parser.name}> connection watchdog: reconnect={rs485 in rs485_obj_list}, "
+                         f"idle check={rs485 in idle_check_list}", self)
             self.thread_timer = ThreadTimer(
                 rs485_obj_list,
                 reconnect_limit_sec=self.rs485_reconnect_limit,
-                verbose_regular_publish=self.verbose_mqtt_regular_publish
+                verbose_regular_publish=self.verbose_mqtt_regular_publish,
+                idle_check_list=idle_check_list
             )
             self.thread_timer.sig_terminated.connect(self.onThreadTimerTerminated)
             self.thread_timer.sig_publish_regular.connect(self.publish_all)
