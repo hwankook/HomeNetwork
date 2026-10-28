@@ -13,6 +13,8 @@ Usage (e.g. in Home Assistant "Terminal & SSH" add-on):
     python3 ew11_capture.py --seconds 180         # longer capture (operate wallpad meanwhile)
     python3 ew11_capture.py --send "F7 0B 01 34 02 41 10 06 00 ?? EE" --repeat 10
         # send a packet ('??' = auto XOR checksum) while capturing
+    python3 ew11_capture.py --host 192.168.0.102 --subphone --seconds 120
+        # kitchen subphone line (EW11 must be set to 3840 bps, 8E1): 7F .. EE packets
 """
 import argparse
 import datetime
@@ -41,6 +43,24 @@ HEADER_NAMES = {
     0x4B: '??(4B)',
 }
 TYPE_NAMES = {0x01: 'Q', 0x02: 'C', 0x04: 'R'}  # query / command / response
+SUBPHONE_NAMES = {
+    0xB4: '현관문 열기 (서브폰->월패드)',
+    0xB5: '현관 벨 울림 시작',
+    0xB6: '현관 벨 울림 종료',
+    0xB7: '현관 영상 서브폰 우회',
+    0xB8: '현관 통화 종료',
+    0xB9: '서브폰 현관 통화 시작',
+    0xBA: '서브폰 현관 통화 종료',
+    0xBB: '현관 통화 종료',
+    0x5A: '공동현관 호출 시작',
+    0x5C: '공동현관 호출 종료',
+    0x5E: '공동현관 통화 종료',
+    0x5F: '공동현관 영상 우회',
+    0x61: '공동현관문 열기',
+    0xE0: 'HEMS 조회',
+    0xE1: 'HEMS 응답',
+    0xE2: '시각',
+}
 WATCH_HEADERS = (0x18, 0x34)
 
 
@@ -158,6 +178,122 @@ def describe(pkt: bytes) -> str:
     return '[%s/%s]' % (name, TYPE_NAMES.get(typ, '%02X' % typ))
 
 
+class SubphoneFramer:
+    # 주방 서브폰 라인: 7F XX .. EE (길이 필드 없음, PacketParser의 SUBPHONE 해석 방식과 동일)
+    def __init__(self):
+        self.buf = bytearray()
+        self.dropped = 0
+
+    def feed(self, data: bytes):
+        self.buf.extend(data)
+        out = []
+        while True:
+            idx = self.buf.find(0x7F)
+            if idx < 0:
+                self.dropped += len(self.buf)
+                self.buf.clear()
+                break
+            if idx > 0:
+                self.dropped += idx
+                del self.buf[:idx]
+            end = self.buf.find(0xEE, 1)
+            if end < 0:
+                if len(self.buf) > 64:
+                    self.dropped += 1
+                    del self.buf[:1]
+                    continue
+                break
+            out.append(bytes(self.buf[:end + 1]))
+            del self.buf[:end + 1]
+        return out
+
+
+def describe_subphone(pkt: bytes) -> str:
+    code = pkt[1] if len(pkt) > 1 else -1
+    name = SUBPHONE_NAMES.get(code)
+    if name is None:
+        group = {0xB0: '현관', 0x50: '공동현관', 0x60: '공동현관', 0xE0: 'HEMS'}.get(code & 0xF0, '미확인')
+        name = '%s(%02X)' % (group, code)
+    return name
+
+
+def run_subphone(args, log, sock, send_pkt):
+    log('# subphone mode: EW11 시리얼 설정이 3840 bps / 8 / Even / 1 이어야 합니다.')
+    log('# 캡처 중에 서브폰 버튼(현관 모니터 등)을 누르거나, 공동현관에서 우리 집을 호출해 보세요.')
+    log('')
+    framer = SubphoneFramer()
+    total_bytes = 0
+    raw_sample = bytearray()
+    regular_like = 0
+    counts = defaultdict(int)
+    uniq = OrderedDict()
+    t0 = time.time()
+    sent = 0
+    next_send = t0 + args.send_after
+    try:
+        while time.time() - t0 < args.seconds:
+            now = time.time()
+            if send_pkt is not None and sent < args.repeat and now >= next_send:
+                sock.sendall(send_pkt)
+                sent += 1
+                next_send = now + args.interval
+                log('%7.2fs  >> SEND %s' % (now - t0, hexs(send_pkt)))
+            try:
+                data = sock.recv(1024)
+            except socket.timeout:
+                continue
+            if not data:
+                log('!! EW11 연결 끊김')
+                break
+            total_bytes += len(data)
+            regular_like += data.count(b'\xf7\x0b\x01') + data.count(b'\xf7\x0d\x01')
+            if len(raw_sample) < 512:
+                raw_sample.extend(data[:512 - len(raw_sample)])
+            for pkt in framer.feed(data):
+                code = pkt[1] if len(pkt) > 1 else 0
+                counts[code] += 1
+                key = hexs(pkt)
+                t = time.time() - t0
+                if key not in uniq:
+                    uniq[key] = [1, t, t]
+                    log('%7.2fs  NEW [%s] %s' % (t, describe_subphone(pkt), key))
+                else:
+                    uniq[key][0] += 1
+                    uniq[key][2] = t
+    except KeyboardInterrupt:
+        log('# interrupted')
+    finally:
+        sock.close()
+
+    elapsed = time.time() - t0
+    log('')
+    log('=' * 72)
+    log('# 요약: %.0fs, %d bytes, 패킷 %d개, 버린 바이트 %d' % (elapsed, total_bytes, sum(counts.values()), framer.dropped))
+    log('=' * 72)
+    for code in sorted(counts):
+        log('  %02X %-24s %5d개' % (code, describe_subphone(bytes([0x7F, code])), counts[code]))
+    log('')
+    log('# 판정')
+    if total_bytes == 0:
+        log('* 데이터가 전혀 없습니다. A/B 선이 틀렸거나, 이벤트가 없어 회선이 조용했을 수 있습니다.')
+        log('  캡처 중 서브폰 버튼을 눌러 보고, 그래도 0이면 연결 위치/A·B를 확인하세요.')
+    elif regular_like > 3:
+        log('* F7 .. 형식(일반 RS-485) 패킷이 보입니다. 서브폰 선이 아니라 일반 기기 라인에 연결된 것 같습니다.')
+    elif not counts:
+        log('* 데이터는 들어오지만 7F .. EE 형식이 아닙니다.')
+        log('  → EW11 시리얼 설정(3840 bps, 8E1)을 확인하세요. EW11에서 3840을 지원하지 않으면 USB-RS485 컨버터가 필요합니다.')
+        log('  → A/B를 바꿔 물려 보세요.')
+        log('  raw 샘플: ' + hexs(raw_sample[:96]))
+    else:
+        log('* 서브폰 패킷 수신 정상. 애드온에 이 EW11을 packettype: 1 포트로 추가하면 됩니다.')
+        if any(c in counts for c in (0x5A, 0x5C, 0x5E, 0x5F)):
+            log('  공동현관 호출 패킷도 확인됨.')
+        else:
+            log('  (공동현관 호출 패킷은 아직 없음 - 공동현관에서 호출해 보면 5A/5C가 보여야 합니다)')
+    log('')
+    log('# 결과 파일: %s' % os.path.abspath(log.path))
+
+
 def main():
     ap = argparse.ArgumentParser(description='EW11 Hillstate RS-485 capture & diagnosis')
     ap.add_argument('--host', default='192.168.0.100')
@@ -169,6 +305,8 @@ def main():
     ap.add_argument('--interval', type=float, default=0.2)
     ap.add_argument('--send-after', type=float, default=5.0, help='seconds before sending')
     ap.add_argument('--all', action='store_true', help='print every new unique packet (not only 0x18/0x34)')
+    ap.add_argument('--subphone', action='store_true',
+                    help='kitchen subphone line mode (7F .. EE packets, EW11 at 3840 bps 8E1)')
     args = ap.parse_args()
 
     out_path = args.out or 'ew11_capture_%s.txt' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -189,6 +327,10 @@ def main():
         log.close()
         sys.exit(1)
     sock.settimeout(0.5)
+    if args.subphone:
+        run_subphone(args, log, sock, send_pkt)
+        log.close()
+        return
     log('# connected. 이제 월패드에서 난방 켜기/끄기, 온도 변경, 엘리베이터 호출을 해 보세요.')
     log('')
 
