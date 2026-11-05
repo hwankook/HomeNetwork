@@ -998,13 +998,21 @@ class PacketParser:
                 writeLog("[SUBPHONE][?]{}".format(self.prettifyPacket(packet)))
 
     def handleDoorlock(self, packet: bytearray):
-        unknown = True
-        if packet[4] == 0x01:
-            if packet[5] == 0x40:
-                if len(packet) >= 13:
-                    # packet[8:13] = month-day-hour-minute-second
-                    unknown = False
-        elif packet[4] == 0x02:
-            pass
-        if unknown:
-            self.log(f'Doorlock Packet: {self.prettifyPacket(packet)}')
+        # 현관 도어락(0x1E): 의미가 아직 밝혀지지 않아 모든 패킷을 기록하고 MQTT 진단 센서로 전달한다 (분석용)
+        packet_type = packet[4] if len(packet) > 4 else -1
+        type_name = {0x01: 'Q', 0x02: 'C', 0x04: 'R'}.get(packet_type, '%02X' % (packet_type & 0xFF))
+        info = {
+            'device': DeviceType.DOORLOCK,
+            'data_type': 'raw_packet',
+            'packet': self.prettifyPacket(packet),
+            'packet_type': type_name,
+            'port': self.name,
+        }
+        if len(packet) >= 13 and packet_type == 0x01 and packet[5] == 0x40:
+            # 원작자 분석: packet[8:13] = 월-일-시-분-초
+            info['time_field'] = '{:02d}-{:02d} {:02d}:{:02d}:{:02d}'.format(*packet[8:13])
+        msg = f"[DOORLOCK][{type_name}] {info['packet']}"
+        if 'time_field' in info:
+            msg += f" (time field: {info['time_field']})"
+        self.log(msg)
+        self.updateDeviceState(info)

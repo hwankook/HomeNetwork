@@ -1175,6 +1175,10 @@ class Home:
                 writeLog(f'{e}: {dev}, {dev.mqtt_state_topic}', self)
 
     def handlePacketParseResult(self, result: dict):
+        if result.get('device') is DeviceType.DOORLOCK and result.get('data_type') == 'raw_packet':
+            # 도어락 패킷은 기기 등록 없이 진단용 MQTT 센서로만 전달 (탐색 모드에서도 기기로 등록하지 않음)
+            self.publishDoorlockRawPacket(result)
+            return
         if self.discover_device:
             self.updateDiscoverDeviceList(result)
         else:
@@ -1291,6 +1295,48 @@ class Home:
         except Exception as e:
             writeLog('updateDeviceState::Exception::{} ({})'.format(e, result), self)
 
+    doorlock_packet_count: int = 0
+
+    def getDoorlockDiagTopic(self) -> str:
+        return f'{self.mqtt_topic_prefix}/state/rs485_packet/doorlock'
+
+    def configMQTTDoorlockDiag(self):
+        # 도어락(0x1E) RS-485 패킷 진단 센서 (HA: sensor.doorlock_rs485_packet)
+        if self.mqtt_client is None:
+            return
+        try:
+            unique_id = 'hillstate_rs485_doorlock_packet'
+            topic = self.getDoorlockDiagTopic()
+            obj = {
+                "name": "Doorlock RS485 Packet",
+                "unique_id": unique_id,
+                "state_topic": topic,
+                "value_template": "{{ value_json.received_at }} {{ value_json.packet[:200] }}",
+                "json_attributes_topic": topic,
+                "icon": "mdi:lock-question",
+                "entity_category": "diagnostic",
+            }
+            self.mqtt_client.publish(f'{self.ha_mqtt_discover_prefix}/sensor/{unique_id}/config', json.dumps(obj), 1, True)
+        except Exception as e:
+            writeLog(f'configMQTTDoorlockDiag::Exception::{e}', self)
+
+    def publishDoorlockRawPacket(self, result: dict):
+        try:
+            self.doorlock_packet_count += 1
+            obj = {
+                'received_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'packet': result.get('packet', ''),
+                'packet_type': result.get('packet_type', ''),
+                'port': result.get('port', ''),
+                'count_since_start': self.doorlock_packet_count,
+            }
+            if result.get('time_field'):
+                obj['time_field'] = result.get('time_field')
+            if self.mqtt_client is not None:
+                self.mqtt_client.publish(self.getDoorlockDiagTopic(), json.dumps(obj, ensure_ascii=False), 1, True)
+        except Exception as e:
+            writeLog(f'publishDoorlockRawPacket::Exception::{e}', self)
+
     def isSubphoneActivated(self) -> bool:
         return self.findDevice(DeviceType.SUBPHONE, 0, 0) is not None
     
@@ -1355,8 +1401,17 @@ class Home:
             self.mqtt_is_connected = True
             writeLog('Conneted to MQTT Broker', self)
             self.startMqttSubscribe()
+            self.configMQTTDoorlockDiag()
         else:
             self.mqtt_is_connected = False
+            reasons = {
+                1: 'incorrect protocol version',
+                2: 'invalid client identifier',
+                3: 'server unavailable',
+                4: 'bad username or password',
+                5: 'not authorised (check mqtt_broker username/password)',
+            }
+            writeLog(f'Failed to connect MQTT Broker (rc={rc}: {reasons.get(rc, "unknown")})', self)
 
     def onMqttClientDisconnect(self, _, userdata, rc):
         self.mqtt_is_connected = False
