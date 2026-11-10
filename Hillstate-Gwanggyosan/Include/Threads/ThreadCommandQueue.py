@@ -349,22 +349,33 @@ class ThreadCommandQueue(threading.Thread):
             return
         """
         dev.checkStaleState()
+        if dev.isCalling(target):
+            # 이미 호출중인데 같은 호출 패킷을 다시 보내면 월패드가 호출을 취소/무시하는 경우가 있다
+            # (예: 버튼을 연달아 눌러 명령이 2번 들어온 경우) -> 진행중인 호출을 그대로 둔다
+            writeLog(f'set_elevator_call({target})::already calling (call state: {dev.state_call}), '
+                     f'not sending again', self)
+            return
         packet_candidates = dev.makePacketCallCandidates(target)
-        interval, retry_cnt = self.getSendParams(parser)
+        ack_wait = max(0.2, float(dev.call_ack_wait_sec))
+        max_attempts = max(1, int(dev.call_max_attempts))
         success = False
         last_sent = None
-        while cnt < retry_cnt:
-            # 최소 1회는 반드시 전송하고, 전송 시작 이후에 바뀐 상태만 성공으로 인정
-            if cnt > 0 and dev.check_call_command_done(target, tm_start):
-                success = True
-                break
-            if parser.isRS485LineBusy():
+        while cnt < max_attempts and not success:
+            # RS485 라인이 비기를 잠깐 기다린 뒤 전송 (무한 대기 방지)
+            tm_busy = time.perf_counter()
+            while parser.isRS485LineBusy() and time.perf_counter() - tm_busy < 1.0:
                 time.sleep(1e-3)  # prevent cpu occupation
-                continue
             last_sent = packet_candidates[cnt % len(packet_candidates)]
             parser.sendPacket(last_sent)
             cnt += 1
-            time.sleep(interval)  # wait for parsing response
+            # 월패드가 상태(04) 패킷에 반영할 때까지 기다린다 - 반영되면 재전송하지 않음
+            # 전송 시작 이후에 바뀐 상태만 성공으로 인정
+            tm_sent = time.perf_counter()
+            while time.perf_counter() - tm_sent < ack_wait:
+                if dev.check_call_command_done(target, tm_start):
+                    success = True
+                    break
+                time.sleep(0.02)
         if cnt > 0:
             tm_elapsed = time.perf_counter() - tm_start
             writeLog('set_elevator_call({})::send # = {}, elapsed = {:g} msec, success = {}'.format(

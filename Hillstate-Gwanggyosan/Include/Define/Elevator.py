@@ -105,6 +105,19 @@ class Elevator(Device):
     call_state_stale_sec: float = 60.  # 응답 패킷 없이 이 시간이 지나면 호출 상태(state_call)를 idle로 간주
     state_stale_sec: float = 300.  # state(호출중/도착)가 이 시간 이상 그대로면 idle로 복귀
 
+    # 호출 명령 전송 파라미터
+    # 월패드는 호출 패킷을 받은 뒤 상태(04) 패킷에 반영하기까지 최대 1초 남짓 걸린다.
+    # 반영되기 전에 호출 패킷을 연달아 보내면(0.2초 간격 재전송) 호출이 취소되거나 엘리베이터가
+    # 응답하지 않는 경우가 로그에서 반복적으로 관찰되어, 한 번 보낸 뒤 충분히 기다렸다가 재전송한다.
+    call_ack_wait_sec: float = 1.5  # 호출 패킷 1회 전송 후 월패드 상태 반영을 기다리는 시간
+    call_max_attempts: int = 3  # 호출 패킷 최대 전송 횟수
+
+    # 도착하지 못한 채 호출이 끝난 경우(월패드 타임아웃) 자동으로 다시 호출하는 횟수 (사용자 명령 1회당)
+    auto_recall_max: int = 1
+    auto_recall_count: int = 0
+    last_call_target: int = 6  # 마지막으로 요청된 호출 방향 (자동 재호출에 사용)
+    ev_info_received_in_call: bool = False  # 이번 호출 중 엘리베이터 호기 정보(층/방향) 수신 여부
+
     _thread_state_change_timer: Union[ThreadStateChangeTimer, None] = None
 
     def __init__(self, name: str = 'Elevator', index: int = 0, room_index: int = 0, topic_prefix: str = 'home'):
@@ -355,6 +368,8 @@ class Elevator(Device):
                     dev_info = find[0]
                 if dev_info.command_state != command_state:
                     self.time_dev_cmd_changed = time.perf_counter()
+                if self.state in [5, 6]:
+                    self.ev_info_received_in_call = True
                 dev_info.command_state = command_state
                 dev_info.moving_state = moving_state
                 dev_info.floor = floor
@@ -387,6 +402,7 @@ class Elevator(Device):
                         self.state = self.state_call
                     writeLog(f"Started calling ({self.state_call})", self)
                     self.time_call_started = time.perf_counter()
+                    self.ev_info_received_in_call = False
                 else:
                     # 0 = IDLE
                     writeLog(f"Finished calling", self)
@@ -422,11 +438,15 @@ class Elevator(Device):
                     self.time_arrived = time.perf_counter()
                     elapsed = self.time_arrived - self.time_call_started
                     writeLog("Arrived! (elapsed from call start: {:g} sec)".format(elapsed), self)
+                    self.auto_recall_count = 0
                     self.publishMQTT()
                 elif self.state == 0:
                     elapsed = time.perf_counter() - self.time_call_started
-                    writeLog("Called but did not arrived (maybe wallpad error(timeout), elapsed from call start: {:g} sec)".format(elapsed), self)
+                    writeLog("Called but did not arrived (maybe wallpad error(timeout), elapsed from call start: {:g} sec, "
+                             "elevator info {}received during call)".format(
+                                 elapsed, '' if self.ev_info_received_in_call else 'NOT '), self)
                     self.publishMQTT()
+                    self.requestAutoRecall()
             elif self.state_prev == 1 and self.state == 0:
                 writeLog("Set arrived flag", self)
                 self.arrived_flag = True
@@ -536,6 +556,27 @@ class Elevator(Device):
                     writeLog(f"check command done: dev<{info.index}> command state is now <{info.command_state}>", self)
                     return True
         return False
+
+    def isCalling(self, target: int) -> bool:
+        """월패드가 이미 target 방향으로 호출중인지 (응답 패킷 기준)"""
+        if target == CommandState.IDLE:
+            return False
+        return self.state_call in {target, self.getCallPacketValue(target)}
+
+    def onUserCallCommand(self, target: int):
+        """사용자(HA/MQTT)가 직접 보낸 호출 명령 - 자동 재호출 횟수 초기화"""
+        if target in [CommandState.UPSIDE, CommandState.DOWNSIDE, CommandState.DOWNSIDE2]:
+            self.last_call_target = int(target)
+            self.auto_recall_count = 0
+
+    def requestAutoRecall(self):
+        """도착하지 못한 채 호출이 끝났을 때 1회 자동 재호출 (명령 큐로 전달)"""
+        if self.auto_recall_count >= self.auto_recall_max:
+            writeLog(f"Auto re-call skipped (already re-called {self.auto_recall_count} time(s))", self)
+            return
+        self.auto_recall_count += 1
+        writeLog(f"Auto re-call ({self.auto_recall_count}/{self.auto_recall_max}), target: {self.last_call_target}", self)
+        self.sig_set_state.emit(self.last_call_target)
 
     def checkStaleState(self):
         """

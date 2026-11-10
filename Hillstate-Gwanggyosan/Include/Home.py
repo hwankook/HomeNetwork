@@ -1373,6 +1373,13 @@ class Home:
                 category='state',
                 target='HEAT' if state else 'OFF'
             )
+        elif isinstance(dev, Elevator):
+            # 자동 재호출 (Elevator.requestAutoRecall)
+            self.send_command(
+                device=dev,
+                category='state',
+                target=state
+            )
 
     def startMqttSubscribe(self):
         topics = [
@@ -1726,6 +1733,10 @@ class Home:
         device = self.findDevice(DeviceType.ELEVATOR, dev_idx, room_idx)
         if device is not None:
             if 'state' in message.keys():
+                try:
+                    device.onUserCallCommand(int(message['state']))
+                except Exception as e:
+                    writeLog(f'onMqttCommandElevator::onUserCallCommand error ({e})', self)
                 self.send_command(
                     device=device,
                     category='state',
